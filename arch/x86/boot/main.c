@@ -145,6 +145,8 @@ void main(void)
 	/* End of heap check */
 	init_heap();
 
+	puts("Hello, Linux. From boot code.\n");
+
 	/* Make sure we have all the proper CPU support */
 	if (validate_cpu()) {
 		puts("Unable to boot - please use a kernel appropriate for your CPU.\n");

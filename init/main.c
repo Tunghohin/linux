@@ -909,6 +909,7 @@ static void __init early_numa_node_init(void)
 asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
 void start_kernel(void)
 {
+	early_printk("Hello, Linux!\n");
 	char *command_line;
 	char *after_dashes;
 
