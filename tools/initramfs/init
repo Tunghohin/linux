@@ -2,23 +2,237 @@
 
 set -eu
 
-export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export HOME=/root
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-mount -t devtmpfs devtmpfs /dev 2>/dev/null || {
-    mkdir -p /dev
-    mount -t tmpfs tmpfs /dev
-    [ -c /dev/console ] || mknod /dev/console c 5 1
-    [ -c /dev/null ] || mknod /dev/null c 1 3
+cmdline_get() {
+    local key="$1"
+    local arg
+
+    for arg in $(cat /proc/cmdline 2>/dev/null || true); do
+        case "$arg" in
+            "$key"=*)
+                printf '%s\n' "${arg#*=}"
+                return 0
+                ;;
+        esac
+    done
+
+    return 1
 }
 
-mkdir -p /proc /sys /tmp /root
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
+mount_fs() {
+    local fstype="$1"
+    local source="$2"
+    local target="$3"
+    local options="${4:-}"
+
+    mkdir -p "$target"
+    if [ -n "$options" ]; then
+        mount -t "$fstype" -o "$options" "$source" "$target" 2>/dev/null || true
+    else
+        mount -t "$fstype" "$source" "$target" 2>/dev/null || true
+    fi
+}
+
+wait_for_block_device() {
+    local device="$1"
+    local retries="${2:-20}"
+
+    while [ "$retries" -gt 0 ]; do
+        if [ -b "$device" ]; then
+            return 0
+        fi
+        sleep 1
+        retries=$((retries - 1))
+    done
+
+    return 1
+}
+
+setup_devices() {
+    mkdir -p /dev /dev/pts
+
+    if ! mount -t devtmpfs devtmpfs /dev 2>/dev/null; then
+        mount -t tmpfs tmpfs /dev
+        [ -c /dev/console ] || mknod /dev/console c 5 1
+        [ -c /dev/null ] || mknod /dev/null c 1 3
+        [ -c /dev/ptmx ] || mknod /dev/ptmx c 5 2
+        [ -c /dev/tty ] || mknod /dev/tty c 5 0
+    fi
+
+    mount_fs devpts devpts /dev/pts
+}
+
+start_shell() {
+    if [ -x /bin/bash ]; then
+        echo "Dropping into /bin/bash."
+        exec /bin/bash -l
+    fi
+
+    if [ -x /bin/sh ]; then
+        echo "Dropping into /bin/sh."
+        exec /bin/sh
+    fi
+
+    if [ -x /bin/busybox ]; then
+        echo "Dropping into BusyBox shell."
+        exec /bin/busybox sh
+    fi
+
+    echo "No usable shell found in initramfs." >&2
+    exit 1
+}
+
+switch_to_rootfs() {
+    local root_device="$1"
+    local root_target="/mnt/rootfs"
+
+    mkdir -p "$root_target"
+
+    if ! wait_for_block_device "$root_device" 20; then
+        echo "Timed out waiting for root device: $root_device" >&2
+        return 1
+    fi
+
+    if ! mount -t ext4 "$root_device" "$root_target"; then
+        echo "Failed to mount rootfs from $root_device" >&2
+        return 1
+    fi
+
+    mkdir -p "$root_target"/proc "$root_target"/sys "$root_target"/dev "$root_target"/run
+    mount --move /proc "$root_target/proc"
+    mount --move /sys "$root_target/sys"
+    mount --move /dev "$root_target/dev"
+    mount --move /run "$root_target/run"
+
+    # Preserve DNS learned from kernel IP autoconfiguration (ip=dhcp) so the
+    # switched rootfs can resolve names even without a full DHCP client.
+    mkdir -p "$root_target/etc"
+    {
+        if [ -r /proc/net/pnp ]; then
+            sed -n 's/^[[:space:]]*nameserver[[:space:]]\{1,\}\([0-9][0-9.]*\)$/nameserver \1/p' /proc/net/pnp
+        fi
+    } > "$root_target/etc/resolv.conf"
+
+    if [ ! -s "$root_target/etc/resolv.conf" ]; then
+        cat > "$root_target/etc/resolv.conf" <<'EOF'
+nameserver 10.0.2.3
+EOF
+    fi
+
+    # Debian commonly installs /sbin/init and /bin/systemd as absolute
+    # symlinks to /lib/systemd/systemd. Testing those symlinks from the
+    # initramfs namespace can fail even though the target exists in rootfs, so
+    # probe the real binary path first.
+    if [ -x "$root_target/lib/systemd/systemd" ]; then
+        exec switch_root "$root_target" /lib/systemd/systemd
+    fi
+
+    if [ -x "$root_target/usr/lib/systemd/systemd" ]; then
+        exec switch_root "$root_target" /usr/lib/systemd/systemd
+    fi
+
+    if [ -x "$root_target/sbin/init" ]; then
+        exec switch_root "$root_target" /sbin/init
+    fi
+
+    if [ -x "$root_target/bin/systemd" ]; then
+        exec switch_root "$root_target" /bin/systemd
+    fi
+
+    echo "Mounted rootfs does not contain a usable init." >&2
+    return 1
+}
+
+setup_devices
+mkdir -p /proc /root /run /sys/fs/cgroup /tmp
+chmod 1777 /tmp 2>/dev/null || true
+
+mount_fs proc proc /proc
+mount_fs sysfs sysfs /sys
+mount_fs tmpfs tmpfs /run mode=0755,nodev,nosuid
+mount_fs cgroup2 none /sys/fs/cgroup
+
+# These mountpoints must exist on the live /dev and /sys mounts that will be
+# moved into the real rootfs. Creating them only inside the disk rootfs is not
+# enough because mount --move hides those on-disk placeholders.
+mkdir -p \
+    /dev/hugepages \
+    /dev/mqueue \
+    /sys/kernel/debug \
+    /sys/kernel/tracing
+
+# Mount these kernel filesystems early so they remain available after
+# switch_root without relying on the minimal Debian userspace to mount them.
+mount_fs hugetlbfs hugetlbfs /dev/hugepages
+mount_fs mqueue mqueue /dev/mqueue
+mount_fs debugfs debugfs /sys/kernel/debug
+mount_fs tracefs tracefs /sys/kernel/tracing
+
+if [ -r /etc/hostname ] && command -v hostname >/dev/null 2>&1; then
+    hostname "$(cat /etc/hostname)" 2>/dev/null || true
+fi
+
+requested_exec="$(cmdline_get initramfs.exec || true)"
+requested_target="$(cmdline_get initramfs.target || true)"
+requested_root="$(cmdline_get initramfs.root || true)"
+kernel_root="$(cmdline_get root || true)"
+variant="$(cat /etc/initramfs-variant 2>/dev/null || true)"
 
 echo
-echo "BusyBox initramfs is up."
-echo "Kernel command line: $(cat /proc/cmdline)"
-echo "Dropping into a shell."
+if [ -r /etc/debian_version ]; then
+    echo "Debian initramfs is up."
+else
+    echo "BusyBox initramfs is up."
+fi
+echo "Kernel command line: $(cat /proc/cmdline 2>/dev/null || true)"
 echo
 
-exec /bin/busybox sh
+if [ -n "$requested_exec" ]; then
+    if [ -x "$requested_exec" ]; then
+        echo "Executing $requested_exec from initramfs.exec."
+        exec "$requested_exec"
+    fi
+    echo "Requested initramfs.exec is not executable: $requested_exec" >&2
+fi
+
+if [ -z "$requested_root" ] && [ "$variant" = "debian" ]; then
+    case "$kernel_root" in
+        /dev/*)
+            requested_root="$kernel_root"
+            ;;
+    esac
+fi
+
+if [ -z "$requested_root" ] && [ "$variant" = "debian" ]; then
+    requested_root="/dev/vda"
+fi
+
+if [ -n "$requested_root" ] && command -v switch_root >/dev/null 2>&1; then
+    echo "Switching to rootfs on $requested_root."
+    if switch_to_rootfs "$requested_root"; then
+        exit 0
+    fi
+fi
+
+if [ "$requested_target" = "init" ]; then
+    if [ -x /sbin/init ]; then
+        echo "Starting /sbin/init."
+        exec /sbin/init
+    fi
+
+    if [ -x /bin/systemd ]; then
+        echo "Starting /bin/systemd."
+        exec /bin/systemd
+    fi
+
+    if [ -x /usr/lib/systemd/systemd ]; then
+        echo "Starting /usr/lib/systemd/systemd."
+        exec /usr/lib/systemd/systemd
+    fi
+
+    echo "initramfs.target=init requested, but no init binary was found." >&2
+fi
+
+start_shell

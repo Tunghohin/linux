@@ -1,0 +1,44 @@
+#!/bin/sh
+
+set -eu
+
+export HOME=/root
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+mount_once() {
+    local fstype="$1"
+    local source="$2"
+    local target="$3"
+    local options="${4:-}"
+
+    mkdir -p "$target"
+    if grep -qs " $target " /proc/mounts 2>/dev/null; then
+        return 0
+    fi
+
+    if [ -n "$options" ]; then
+        mount -t "$fstype" -o "$options" "$source" "$target" 2>/dev/null || true
+    else
+        mount -t "$fstype" "$source" "$target" 2>/dev/null || true
+    fi
+}
+
+mount_once proc proc /proc
+mount_once sysfs sysfs /sys
+mount_once devtmpfs devtmpfs /dev
+mount_once devpts devpts /dev/pts
+mount_once tmpfs tmpfs /run mode=0755,nodev,nosuid
+mount_once tmpfs tmpfs /tmp mode=1777,nodev,nosuid
+
+hostname debian-rootfs 2>/dev/null || true
+
+echo
+echo "Debian root filesystem is up."
+echo "Type 'poweroff -f' or press Ctrl-A X in QEMU to exit."
+echo
+
+if [ -x /bin/bash ]; then
+    exec /bin/bash -l
+fi
+
+exec /bin/sh
