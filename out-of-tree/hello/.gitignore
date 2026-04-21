@@ -1,0 +1,5 @@
+# this is build directory, ignore it
+*
+!.gitignore
+!Makefile
+!hello.c
